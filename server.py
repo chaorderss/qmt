@@ -240,16 +240,19 @@ def _normalize_price_type(value):
     if not text:
         return 11
     mapping = {
-        'LIMIT': 11,
+        'LIMIT': 11,        # 指定价/模型价 (price 有效)
         'FIX': 11,
-        'MARKET': 18,
-        'MARKET_BEST': 18,
-        'BEST': 18,
+        'MODEL': 11,
+        'MARKET': 5,        # 最新价市价单 (真市价, 等价旧桥 LATEST_PRICE; price 被忽略)
+        'LATEST': 5,
+        'MARKET_BEST': 14,  # 对手价
+        'BEST': 14,
+        'OPPOSITE': 14,
     }
     if text in mapping:
         return mapping[text]
     number = _normalize_int(value)
-    if number is not None and number > 0:
+    if number is not None and number >= 0:
         return int(number)
     return 11
 
@@ -842,13 +845,27 @@ def _extract_order_time(record):
     return None
 
 
+def _order_symbol_hint(remark):
+    if remark in (None, ''):
+        return None
+    index = getattr(RUNTIME, 'order_symbol_index', None)
+    if not isinstance(index, dict):
+        return None
+    return index.get(str(remark))
+
+
 def _build_order_record(order):
     payload = _make_jsonable(order)
     if isinstance(payload, dict):
-        payload['symbol'] = _extract_order_symbol(order if not isinstance(order, dict) else payload)
+        symbol = _extract_order_symbol(order if not isinstance(order, dict) else payload)
+        if symbol is None:
+            # QMT 委托对象不含证券代码字段, 未成交单也无成交可回填: 用下单时按 remark(=batch_id) 记录的代码
+            hint_remark = _get_attr(order if not isinstance(order, dict) else payload, ['remark', 'm_strRemark'])
+            symbol = _order_symbol_hint(hint_remark)
+        payload['symbol'] = symbol
         payload['side'] = _extract_order_side(order if not isinstance(order, dict) else payload)
         payload['time'] = _extract_order_time(order if not isinstance(order, dict) else payload)
-        payload['price'] = _normalize_number(_get_attr(order if not isinstance(order, dict) else payload, ['price', 'm_dPrice']))
+        payload['price'] = _normalize_number(_get_attr(order if not isinstance(order, dict) else payload, ['price', 'm_dPrice', 'm_dLimitPrice']))
         payload['traded_price'] = _normalize_number(_get_attr(order if not isinstance(order, dict) else payload, ['traded_price', 'm_dTradedPrice']))
         payload['volume'] = _normalize_int(_get_attr(order if not isinstance(order, dict) else payload, ['volume', 'm_nVolumeTotalOriginal']))
         payload['traded_volume'] = _normalize_int(_get_attr(order if not isinstance(order, dict) else payload, ['traded_volume', 'm_nVolumeTraded']))
@@ -860,13 +877,23 @@ def _build_order_record(order):
     return payload
 
 
+def _order_record_is_empty(record):
+    """无任何可用身份/内容的空对象(委托回调偶发的稀疏对象), 不应进入委托列表。"""
+    if not isinstance(record, dict):
+        return True
+    for key in ('order_sys_id', 'order_id', 'symbol', 'volume', 'traded_volume', 'status'):
+        if record.get(key) not in (None, '', 0):
+            return False
+    return True
+
+
 def _store_order_snapshot(payload, source, replace):
     items = payload if isinstance(payload, (list, tuple, set)) else [payload]
     records = []
     index = {} if replace else dict(RUNTIME.order_index)
     for item in items:
         record = _build_order_record(item)
-        if not isinstance(record, dict):
+        if not isinstance(record, dict) or _order_record_is_empty(record):
             continue
         order_key = record.get('order_sys_id') or record.get('order_id') or ('row_%s' % len(records))
         index[str(order_key)] = record
@@ -1296,9 +1323,11 @@ def _get_passorder_callable(context):
 def _submit_stock_order(symbol, side, price, volume, remark, batch_id, source, price_type=None):
     normalized_symbol = _normalize_quote_symbol(symbol)
     normalized_side = _normalize_trade_side(side)
-    normalized_price = _normalize_price(price)
     normalized_volume = _normalize_volume(volume)
     normalized_price_type = _normalize_price_type(price_type)
+    # prType 11(模型价)/49(科创板盘后定价) 时 price 有效, 需合法价; 其它为市价类型, price 被 QMT 忽略, 传 -1
+    is_limit_price = normalized_price_type in (11, 49)
+    normalized_price = _normalize_price(price)
     context = RUNTIME.context_ref
     if context is None:
         return {'error': 'context_unavailable'}
@@ -1306,8 +1335,10 @@ def _submit_stock_order(symbol, side, price, volume, remark, batch_id, source, p
         return {'error': 'invalid_symbol'}
     if normalized_side is None:
         return {'error': 'invalid_side'}
-    if normalized_price is None:
+    if is_limit_price and normalized_price is None:
         return {'error': 'invalid_price'}
+    if not is_limit_price and normalized_price is None:
+        normalized_price = -1.0
     if normalized_volume is None:
         return {'error': 'invalid_volume'}
     account_id = RUNTIME.state.get('account_id')
@@ -1319,6 +1350,13 @@ def _submit_stock_order(symbol, side, price, volume, remark, batch_id, source, p
 
     strategy_name = 'algo-monitor'
     user_order_id = str(batch_id or ('manual-%s' % int(_now() * 1000)))
+    # 记录 remark(=user_order_id) -> 证券代码, 供 /orders 回填(QMT 委托对象本身不带代码)
+    symbol_index = getattr(RUNTIME, 'order_symbol_index', None)
+    if isinstance(symbol_index, dict):
+        symbol_index[user_order_id] = normalized_symbol
+        if len(symbol_index) > 5000:
+            for stale_key in list(symbol_index.keys())[:len(symbol_index) - 4000]:
+                symbol_index.pop(stale_key, None)
     op_type = 23 if normalized_side == 'BUY' else 24
     account_before = _build_accounts_payload()
     quote_before = _build_quote_payload(normalized_symbol)
@@ -1363,11 +1401,77 @@ def _submit_stock_order(symbol, side, price, volume, remark, batch_id, source, p
     }
 
 
+def _get_cancel_callable(context):
+    for name in ('cancel', 'cancel_order'):
+        func = globals().get(name)
+        if callable(func):
+            return func, name
+    for name in ('cancel', 'cancel_order'):
+        func = getattr(context, name, None) if context is not None else None
+        if callable(func):
+            return func, name
+    return None, None
+
+
+def _cancel_stock_order(order_sys_id):
+    context = RUNTIME.context_ref
+    if context is None:
+        return {'error': 'context_unavailable'}
+    order_id = str(order_sys_id or '').strip()
+    if not order_id:
+        return {'error': 'order_sys_id_required'}
+    account_id = RUNTIME.state.get('account_id')
+    if account_id in (None, ''):
+        return {'error': 'account_unavailable'}
+    cancel_func, cancel_func_name = _get_cancel_callable(context)
+    if cancel_func is None:
+        return {'error': 'cancel_unavailable'}
+    account_type = _normalize_account_type(RUNTIME.state.get('account_type')) or DEFAULT_ACCOUNT_TYPE
+    args_variants = [
+        (order_id, str(account_id), account_type, context),
+        (order_id, str(account_id), account_type.lower(), context),
+        (order_id, str(account_id), context),
+        (order_id, context),
+    ]
+    try:
+        result, signature_error, arg_count = _call_passorder_with_fallbacks(cancel_func, args_variants)
+    except Exception as exc:
+        return {
+            'error': 'cancel_failed',
+            'detail': str(exc),
+            'order_sys_id': order_id,
+        }
+    if signature_error is not None:
+        return {
+            'error': 'cancel_signature_error',
+            'detail': str(signature_error),
+            'order_sys_id': order_id,
+        }
+    return {
+        'status': 'submitted',
+        'order_sys_id': order_id,
+        'account_id': str(account_id),
+        'account_type': account_type,
+        'cancel_func': cancel_func_name,
+        'cancel_args_count': arg_count,
+        'submitted_at': _now(),
+        'cancel_result': _make_jsonable(result),
+        'last_error': _make_jsonable(RUNTIME.state.get('last_error')),
+    }
+
+
 def _build_instrument_payload(symbol):
     normalized_symbol = _normalize_quote_symbol(symbol)
     if normalized_symbol is None:
         return {'error': 'symbol_required'}
     function = globals().get('get_instrument_detail')
+    if not callable(function):
+        context = RUNTIME.context_ref
+        for method_name in ('get_instrument_detail', 'get_instrumentdetail'):
+            candidate = getattr(context, method_name, None) if context is not None else None
+            if callable(candidate):
+                function = candidate
+                break
     if not callable(function):
         return {'error': 'instrument_detail_unavailable'}
     try:
@@ -1460,7 +1564,7 @@ def _build_http_response(request_bytes):
                 'endpoints': [
                     '/health', '/positions', '/accounts', '/quotes', '/quote',
                     '/orders', '/deals', '/subscribe', '/unsubscribe', '/candles', '/signals', '/instrument',
-                    '/options', '/option-trade-options', '/longhubang', '/order', '/ws', '/debug/trade',
+                    '/options', '/option-trade-options', '/longhubang', '/order', '/cancel', '/ws', '/debug/trade',
                 ],
             })
         if path == '/health':
@@ -1573,6 +1677,12 @@ def _build_http_response(request_bytes):
             batch_id = (query.get('batch_id') or [''])[0]
             source = (query.get('source') or [''])[0]
             payload = _submit_stock_order(symbol, side, price, volume, remark, batch_id, source, price_type)
+            if payload.get('error'):
+                return _build_json_response(400, payload)
+            return _build_json_response(200, payload)
+        if path == '/cancel':
+            order_sys_id = (query.get('order_sys_id') or [None])[0]
+            payload = _cancel_stock_order(order_sys_id)
             if payload.get('error'):
                 return _build_json_response(400, payload)
             return _build_json_response(200, payload)

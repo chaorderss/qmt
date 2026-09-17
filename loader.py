@@ -1,3 +1,4 @@
+#encoding:gbk
 import importlib.util
 import os
 import sys
@@ -9,7 +10,7 @@ def _resolve_watch_dir():
     candidates = []
     if env_watch_dir:
         candidates.append(env_watch_dir)
-    candidates.append(r'C:\server')
+    candidates.append(r'C:\Users\danni\qmt')
     try:
         candidates.append(os.path.dirname(os.path.abspath(__file__)))
     except Exception:
@@ -22,7 +23,7 @@ def _resolve_watch_dir():
             return candidate
     if env_watch_dir:
         return env_watch_dir
-    return r'C:\server'
+    return r'C:\Users\danni\qmt'
 
 
 WATCH_DIR = _resolve_watch_dir()

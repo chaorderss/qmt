@@ -13,6 +13,7 @@ def create_runtime(runtime_module_name, initial_state):
     runtime.quote_subscriptions = {}
     runtime.latest_quotes = {}
     runtime.quote_sequence = 0
+    runtime.order_symbol_index = {}
     runtime.state = dict(initial_state)
     return runtime
 
@@ -34,7 +35,7 @@ def upgrade_runtime(runtime, defaults):
             old_http_thread.join(2.0)
         except Exception:
             pass
-    for name in ['listener', 'context_ref', 'clients', 'position_index', 'order_index', 'deal_index', 'quote_subscriptions', 'latest_quotes', 'quote_sequence']:
+    for name in ['listener', 'context_ref', 'clients', 'position_index', 'order_index', 'deal_index', 'quote_subscriptions', 'latest_quotes', 'quote_sequence', 'order_symbol_index']:
         if not hasattr(runtime, name):
             setattr(runtime, name, getattr(defaults, name))
     state = getattr(runtime, 'state', None)
